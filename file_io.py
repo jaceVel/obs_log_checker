@@ -142,6 +142,65 @@ def save_files(obs_df, bad_obs_df, pss_df, bad_pss_df, cog_df, bad_cog_df,
             raise
 
 
+# ── Station corrections ────────────────────────────────────────────────────────
+
+def apply_station_corrections(corrections, date_part, qc_dir, removed_dir, log_fn=None):
+    """
+    Write corrected station numbers back to the daily QC files, then rebuild
+    the combined files.
+
+    Args:
+        corrections: dict of {str(file_num): float(new_station)}
+        date_part:   subfolder name, e.g. '2026_04_14_06_50_12'
+        qc_dir:      Path to QC_files/
+        removed_dir: Path to lines_removed_files/
+        log_fn:      optional callable for progress messages (defaults to print)
+
+    Rules:
+        OBS  Station              ← new_station (as-is)
+        PSS  Station              ← new_station (as-is)
+        COG  Source Point Station ← new_station − 0.5
+    """
+    log = log_fn or print
+    qc_dir   = Path(qc_dir)
+    daily_qc = qc_dir / date_part
+
+    # Normalise keys: '2312.0' → '2312' so they match int columns in the CSVs
+    corrections = {str(int(float(fn))): stn for fn, stn in corrections.items()}
+
+    # ── OBS ──────────────────────────────────────────────────────────────────
+    obs_path = daily_qc / f'ObserverLog_Detailed_QC_{date_part}.csv'
+    with open(obs_path) as f:
+        title_line = f.readline()
+    obs_df = pd.read_csv(obs_path, skiprows=2)
+    for fn, new_stn in corrections.items():
+        obs_df.loc[obs_df['File#'].astype(str) == fn, 'Station'] = new_stn
+    with open(obs_path, 'w', newline='') as f:
+        f.write(title_line.rstrip('\n') + '\n\n')
+        obs_df.to_csv(f, index=False)
+    log(f"  Updated OBS: {obs_path.name}")
+
+    # ── PSS ──────────────────────────────────────────────────────────────────
+    pss_path = daily_qc / f'PSS_QC_{date_part}.csv'
+    pss_df = pd.read_csv(pss_path)
+    for fn, new_stn in corrections.items():
+        pss_df.loc[pss_df['File Num'].astype(str) == fn, 'Station'] = new_stn
+    pss_df.to_csv(pss_path, index=False)
+    log(f"  Updated PSS: {pss_path.name}")
+
+    # ── COG ──────────────────────────────────────────────────────────────────
+    cog_path = daily_qc / f'FinalCOG_QC_{date_part}.csv'
+    cog_df = pd.read_csv(cog_path)
+    for fn, new_stn in corrections.items():
+        cog_df.loc[cog_df['FF ID'].astype(str) == fn, 'Source Point Station'] = float(new_stn) - 0.5
+    cog_df.to_csv(cog_path, index=False)
+    log(f"  Updated COG: {cog_path.name}  (Source Point Station = station − 0.5)")
+
+    # ── Rebuild combined ──────────────────────────────────────────────────────
+    combine_files(qc_dir, Path(removed_dir))
+    log("  Combined files rebuilt.")
+
+
 # ── Combine ────────────────────────────────────────────────────────────────────
 
 def combine_files(qc_dir, removed_dir):
