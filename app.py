@@ -1466,12 +1466,16 @@ class CombinedCheckTab(QWidget):
     log = pyqtSignal(str)
 
     _COLS = [
-        ("File#",       "File#"),
-        ("Line",        "Line"),
-        ("Station",     "Station"),
-        ("Local Date",  " Local Date"),
-        ("Local Time",  " Local Time"),
-        ("PSS Info",    " PSS Info"),
+        ("File#",          "File#"),
+        ("Line",           "Line"),
+        ("Station",        "Station"),
+        ("Local Date",     " Local Date"),
+        ("Local Time",     " Local Time"),
+        ("PSS Info",       " PSS Info"),
+        ("Phase Max",      "_Phase Max"),
+        ("Force Max",      "_Force Max"),
+        ("THD Max",        "_THD Max"),
+        ("Dist to SP (m)", "_Dist to SP"),
     ]
 
     def __init__(self, parent=None):
@@ -1521,6 +1525,37 @@ class CombinedCheckTab(QWidget):
             return
 
         obs = pd.read_csv(combined_obs, skiprows=2)
+
+        # Join PSS metrics (max per File#) from combined PSS
+        pss_path = QC_DIR / 'combined' / 'PSS_QC_Combined.csv'
+        if pss_path.exists():
+            pss = pd.read_csv(pss_path)
+            for col in ['Phase Max', 'Force Max', 'THD Max']:
+                pss[col] = pd.to_numeric(pss[col], errors='coerce')
+            pss_agg = (pss.groupby('File Num')[['Phase Max', 'Force Max', 'THD Max']]
+                          .max().reset_index()
+                          .rename(columns={'File Num': 'File#',
+                                           'Phase Max': '_Phase Max',
+                                           'Force Max': '_Force Max',
+                                           'THD Max':   '_THD Max'}))
+            pss_agg['File#'] = pd.to_numeric(pss_agg['File#'], errors='coerce')
+            obs['File#']     = pd.to_numeric(obs['File#'], errors='coerce')
+            obs = obs.merge(pss_agg, on='File#', how='left')
+
+        # Join COG Distance to Source Point
+        cog_path = QC_DIR / 'combined' / 'FinalCOG_QC_Combined.csv'
+        if cog_path.exists():
+            cog = pd.read_csv(cog_path)[['FF ID', 'Distance to Source Point']]
+            cog['Distance to Source Point'] = pd.to_numeric(
+                cog['Distance to Source Point'], errors='coerce')
+            # Filter out bad decoder rows (distance > 1e6 means decoder had no GPS fix)
+            cog.loc[cog['Distance to Source Point'] > 1e6,
+                    'Distance to Source Point'] = pd.NA
+            cog = cog.rename(columns={'FF ID': 'File#',
+                                      'Distance to Source Point': '_Dist to SP'})
+            cog['File#'] = pd.to_numeric(cog['File#'], errors='coerce')
+            obs = obs.merge(cog, on='File#', how='left')
+
         dup_mask = obs.duplicated(subset=['Line', 'Station'], keep=False)
         dups     = obs[dup_mask]
 
