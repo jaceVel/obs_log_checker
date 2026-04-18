@@ -1467,6 +1467,8 @@ class CombinedCheckTab(QWidget):
 
     _COLS = [
         ("File#",       "File#"),
+        ("Line",        "Line"),
+        ("Station",     "Station"),
         ("Local Date",  " Local Date"),
         ("Local Time",  " Local Time"),
         ("PSS Info",    " PSS Info"),
