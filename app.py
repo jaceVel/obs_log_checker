@@ -302,10 +302,13 @@ class Worker(QThread):
                 print("\n  No duplicate shots found.")
 
             # Emit QC'd data for the Stn Num Check and Vibe QC tabs
+            _cog_pos_cols = {'FF ID', 'Decoder Lat', 'Decoder Lon',
+                             'Distance to Source Point',
+                             'Source Point Lat', 'Source Point Lon'}
             self.results_ready.emit(
                 obs_df[['File#', 'Line', 'Station']].copy(),
-                cog_df[['FF ID', 'Decoder Lat', 'Decoder Lon', 'Distance to Source Point']].copy()
-                if {'FF ID', 'Decoder Lat', 'Decoder Lon', 'Distance to Source Point'}.issubset(cog_df.columns)
+                cog_df[list(_cog_pos_cols)].copy()
+                if _cog_pos_cols.issubset(cog_df.columns)
                 else pd.DataFrame(),
                 pss_df.copy(),
                 date_part,
@@ -1014,10 +1017,14 @@ class VibeTab(QWidget):
 
         # ── Top bar ───────────────────────────────────────────────────────────
         top = QHBoxLayout()
-        btn = QPushButton("Load from QC Files")
-        btn.setFixedWidth(160)
-        btn.clicked.connect(self._load)
-        top.addWidget(btn)
+        top.addWidget(QLabel("Dataset:"))
+        self._day_combo = QComboBox()
+        self._day_combo.setMinimumWidth(240)
+        top.addWidget(self._day_combo)
+        load_btn = QPushButton("Load")
+        load_btn.setFixedWidth(60)
+        load_btn.clicked.connect(self._load)
+        top.addWidget(load_btn)
 
         self._pdf_btn = QPushButton("Export PDF Report")
         self._pdf_btn.setFixedWidth(150)
@@ -1028,6 +1035,8 @@ class VibeTab(QWidget):
         top.addStretch()
         layout.addLayout(top)
 
+        self._populate_combo()
+
         # ── Inner tabs ────────────────────────────────────────────────────────
         self._inner = QTabWidget()
         layout.addWidget(self._inner)
@@ -1035,10 +1044,12 @@ class VibeTab(QWidget):
         (self._perf_widget,   self._perf_fig,   self._perf_canvas)   = self._make_chart_widget()
         (self._gps_widget,    self._gps_fig,    self._gps_canvas)    = self._make_chart_widget()
         (self._ground_widget, self._ground_fig, self._ground_canvas) = self._make_chart_widget()
+        (self._pos_widget,    self._pos_fig,    self._pos_canvas)    = self._make_chart_widget()
 
         self._inner.addTab(self._perf_widget,   "Performance (Phase / Force / THD)")
         self._inner.addTab(self._gps_widget,    "GPS Quality (Sats / DOP)")
         self._inner.addTab(self._ground_widget, "Ground Coupling (Viscosity / Stiffness / Drive)")
+        self._inner.addTab(self._pos_widget,    "Vibe Positioning")
 
         tb = self._inner.tabBar()
         tb.setTabToolTip(0,
@@ -1056,6 +1067,11 @@ class VibeTab(QWidget):
             "Stiffness  — ground rigidity at the vibe baseplate interface; higher = harder ground\n"
             "Drive Level — hydraulic force the vibrator is applying (% of max); flat line is normal"
         )
+        tb.setTabToolTip(3,
+            "Offset      — distance each shot fired from its planned source point (m)\n"
+            "Separation  — distance between vibes on the same shot (multi-vibe days only)\n"
+            "Map         — actual vibe positions vs planned source points"
+        )
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -1072,27 +1088,66 @@ class VibeTab(QWidget):
 
     # ── Load / Refresh ────────────────────────────────────────────────────────
 
-    def refresh(self, pss_df):
-        """Populate charts from the current QC run's PSS dataframe."""
-        df = pss_df.copy()
-        self._render(df)
+    def _populate_combo(self, select_date_part=None):
+        """Rebuild the dropdown from QC_DIR. Optionally select a specific date_part."""
+        self._day_combo.blockSignals(True)
+        self._day_combo.clear()
+
+        daily_dirs = sorted(
+            (d for d in QC_DIR.iterdir()
+             if d.is_dir() and d.name != 'combined'
+             and (d / f'PSS_QC_{d.name}.csv').exists()),
+            reverse=True,
+        )
+        for d in daily_dirs:
+            parts = d.name.split('_')           # ['2026','04','14','06','50','12']
+            if len(parts) >= 3:
+                label = f"{parts[0]}-{parts[1]}-{parts[2]}  {parts[3]}:{parts[4]}" \
+                        if len(parts) >= 5 else d.name
+            else:
+                label = d.name
+            self._day_combo.addItem(label, userData=d.name)
+
+        combined_path = QC_DIR / 'combined' / 'PSS_QC_Combined.csv'
+        if combined_path.exists():
+            self._day_combo.addItem('── Combined (all days) ──', userData='combined')
+
+        # Restore selection
+        if select_date_part:
+            for i in range(self._day_combo.count()):
+                if self._day_combo.itemData(i) == select_date_part:
+                    self._day_combo.setCurrentIndex(i)
+                    break
+
+        self._day_combo.blockSignals(False)
+
+    def refresh(self, pss_df, cog_df=None, date_part=None):
+        """Called after a QC run — update dropdown and render the new day's data."""
+        self._populate_combo(select_date_part=date_part)
+        self._render(pss_df.copy(), cog_df.copy() if cog_df is not None else pd.DataFrame())
 
     def _load(self):
-        """Button handler — loads from the combined file (all days)."""
-        combined_path = QC_DIR / 'combined' / 'PSS_QC_Combined.csv'
-        if not combined_path.exists():
-            QMessageBox.warning(self, "File Not Found",
-                                f"Combined PSS file not found:\n{combined_path}"
-                                "\n\nRun QC first.")
+        key = self._day_combo.currentData()
+        if not key:
+            return
+        if key == 'combined':
+            pss_path = QC_DIR / 'combined' / 'PSS_QC_Combined.csv'
+            cog_path = QC_DIR / 'combined' / 'FinalCOG_QC_Combined.csv'
+        else:
+            pss_path = QC_DIR / key / f'PSS_QC_{key}.csv'
+            cog_path = QC_DIR / key / f'FinalCOG_QC_{key}.csv'
+        if not pss_path.exists():
+            QMessageBox.warning(self, "File Not Found", f"PSS file not found:\n{pss_path}")
             return
         try:
-            df = pd.read_csv(combined_path)
+            pss_df = pd.read_csv(pss_path)
+            cog_df = pd.read_csv(cog_path) if cog_path.exists() else pd.DataFrame()
         except Exception as exc:
             QMessageBox.critical(self, "Load Error", str(exc))
             return
-        self._render(df)
+        self._render(pss_df, cog_df)
 
-    def _render(self, df):
+    def _render(self, df, cog_df=None):
         for col in _NUMERIC_COLS:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
@@ -1107,6 +1162,8 @@ class VibeTab(QWidget):
         self._render_grid(self._ground_fig, self._ground_canvas,
                           df, unit_ids, colors, _GROUND_SECTIONS,
                           'Ground Coupling  —  Viscosity / Stiffness / Drive Level')
+        self._render_positioning(df, cog_df if cog_df is not None else pd.DataFrame(),
+                                 unit_ids, colors)
         self._pdf_btn.setEnabled(True)
 
     # ── Rendering ─────────────────────────────────────────────────────────────
@@ -1173,6 +1230,115 @@ class VibeTab(QWidget):
         except Exception as exc:
             import traceback
             QMessageBox.critical(self, "Export Error", traceback.format_exc())
+
+    def _render_positioning(self, pss_df, cog_df, unit_ids, colors):
+        import numpy as np
+        import math
+
+        fig    = self._pos_fig
+        canvas = self._pos_canvas
+        fig.clear()
+
+        threshold = 5.0   # metres
+
+        # ── Row 0: offset from planned source point (from COG) ────────────────
+        ax_off = fig.add_subplot(3, 1, 1)
+        has_offset = (not cog_df.empty
+                      and 'FF ID' in cog_df.columns
+                      and 'Distance to Source Point' in cog_df.columns)
+        if has_offset:
+            cog = cog_df.copy()
+            cog['FF ID'] = pd.to_numeric(cog['FF ID'], errors='coerce')
+            cog['Distance to Source Point'] = pd.to_numeric(
+                cog['Distance to Source Point'], errors='coerce')
+            cog = cog.dropna(subset=['FF ID', 'Distance to Source Point'])
+            cog = cog[cog['Distance to Source Point'] < 1e6].sort_values('FF ID')
+
+            ok  = cog[cog['Distance to Source Point'] <= threshold]
+            bad = cog[cog['Distance to Source Point'] >  threshold]
+            ax_off.scatter(ok['FF ID'],  ok['Distance to Source Point'],
+                           s=8, color='steelblue', label='Within threshold', zorder=3)
+            ax_off.scatter(bad['FF ID'], bad['Distance to Source Point'],
+                           s=12, color='red', label='Exceeds threshold', zorder=4)
+            ax_off.axhline(threshold, color='orange', linewidth=0.9,
+                           linestyle='--', label=f'Threshold ({threshold:.0f} m)')
+            ax_off.set_ylabel('Offset (m)', fontsize=8)
+            ax_off.legend(fontsize=6, loc='upper right')
+        else:
+            ax_off.text(0.5, 0.5, 'No COG offset data available',
+                        ha='center', va='center', transform=ax_off.transAxes, fontsize=9)
+        ax_off.set_title('Offset from Planned Source Point', fontsize=9)
+        ax_off.grid(True, alpha=0.25)
+        ax_off.tick_params(labelsize=7)
+        plt.setp(ax_off.get_xticklabels(), visible=False)
+
+        # ── Row 1: vibe-to-vibe separation ────────────────────────────────────
+        ax_sep = fig.add_subplot(3, 1, 2)
+        pss_df['Lat'] = pd.to_numeric(pss_df['Lat'], errors='coerce')
+        pss_df['Lon'] = pd.to_numeric(pss_df['Lon'], errors='coerce')
+        pss_df['File Num'] = pd.to_numeric(pss_df['File Num'], errors='coerce')
+        multi = pss_df.dropna(subset=['File Num', 'Lat', 'Lon'])
+        grp_sizes = multi.groupby('File Num').size()
+        multi_file_nums = grp_sizes[grp_sizes >= 2].index
+
+        if len(multi_file_nums):
+            seps = []
+            for fn, grp in multi.groupby('File Num'):
+                if fn not in multi_file_nums:
+                    continue
+                lats = grp['Lat'].values
+                lons = grp['Lon'].values
+                # Distance between first two vibes
+                R    = 6_371_000.0
+                dlat = math.radians(lats[1] - lats[0])
+                dlon = math.radians(lons[1] - lons[0])
+                a    = (math.sin(dlat / 2) ** 2
+                        + math.cos(math.radians(lats[0]))
+                        * math.cos(math.radians(lats[1]))
+                        * math.sin(dlon / 2) ** 2)
+                seps.append({'File Num': fn,
+                             'Separation': R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))})
+            sep_df = pd.DataFrame(seps).sort_values('File Num')
+            ax_sep.plot(sep_df['File Num'], sep_df['Separation'],
+                        'o-', markersize=3, linewidth=0.6, color='steelblue')
+            mean_sep = sep_df['Separation'].mean()
+            ax_sep.axhline(mean_sep, color='grey', linewidth=0.8, linestyle=':')
+            ax_sep.text(sep_df['File Num'].iloc[-1], mean_sep,
+                        f' mean {mean_sep:.1f}m', va='bottom', fontsize=6, color='grey')
+            ax_sep.set_ylabel('Separation (m)', fontsize=8)
+        else:
+            ax_sep.text(0.5, 0.5, 'Single-vibe day — no separation data',
+                        ha='center', va='center', transform=ax_sep.transAxes, fontsize=9)
+        ax_sep.set_title('Vibe-to-Vibe Separation', fontsize=9)
+        ax_sep.grid(True, alpha=0.25)
+        ax_sep.tick_params(labelsize=7)
+        plt.setp(ax_sep.get_xticklabels(), visible=False)
+
+        # ── Row 2: map — actual positions vs planned ───────────────────────────
+        ax_map = fig.add_subplot(3, 1, 3)
+        for color, uid in zip(colors, unit_ids):
+            grp = pss_df[pss_df['Unit ID'] == uid].dropna(subset=['Lat', 'Lon'])
+            if not grp.empty:
+                ax_map.scatter(grp['Lon'], grp['Lat'], s=6, color=color,
+                               label=f'Unit {int(uid)}', zorder=3, alpha=0.7)
+
+        if has_offset and 'Source Point Lat' in cog_df.columns and 'Source Point Lon' in cog_df.columns:
+            sp_lat = pd.to_numeric(cog_df['Source Point Lat'], errors='coerce').dropna()
+            sp_lon = pd.to_numeric(cog_df['Source Point Lon'], errors='coerce').dropna()
+            valid  = sp_lat.index.intersection(sp_lon.index)
+            ax_map.scatter(sp_lon[valid], sp_lat[valid], s=4, color='lightgrey',
+                           marker='+', label='Planned', zorder=2)
+
+        ax_map.set_xlabel('Longitude', fontsize=7)
+        ax_map.set_ylabel('Latitude',  fontsize=7)
+        ax_map.set_title('Actual Vibe Positions vs Planned', fontsize=9)
+        ax_map.grid(True, alpha=0.25)
+        ax_map.tick_params(labelsize=7)
+        ax_map.legend(fontsize=6, loc='upper right')
+
+        fig.suptitle('Vibe Positioning', fontsize=9)
+        fig.tight_layout(rect=[0, 0, 1, 0.97])
+        canvas.draw()
 
     def _render_gps(self, df, unit_ids, colors):
         from matplotlib.transforms import blended_transform_factory
@@ -1292,6 +1458,185 @@ class VibeTab(QWidget):
         canvas.draw()
 
 
+# ── Combined File Check tab ───────────────────────────────────────────────────
+
+class CombinedCheckTab(QWidget):
+    """Scan combined OBS for (Line, Station) duplicates and remove them."""
+
+    log = pyqtSignal(str)
+
+    _COLS = [
+        ("File#",       "File#"),
+        ("Local Date",  " Local Date"),
+        ("Local Time",  " Local Time"),
+        ("PSS Info",    " PSS Info"),
+    ]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._btn_groups = []   # list of (shots_list, QButtonGroup)
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        # ── Top bar ───────────────────────────────────────────────────────────
+        top = QHBoxLayout()
+        check_btn = QPushButton("Check for Duplicates")
+        check_btn.setFixedWidth(180)
+        check_btn.clicked.connect(self._check)
+        top.addWidget(check_btn)
+        self._status_lbl = QLabel("")
+        top.addWidget(self._status_lbl)
+        top.addStretch()
+        layout.addLayout(top)
+
+        # ── Scroll area ───────────────────────────────────────────────────────
+        self._scroll    = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._container = QWidget()
+        self._cont_lay  = QVBoxLayout(self._container)
+        self._cont_lay.setSpacing(10)
+        self._scroll.setWidget(self._container)
+        layout.addWidget(self._scroll)
+
+        # ── Apply button ──────────────────────────────────────────────────────
+        self._apply_btn = QPushButton("Apply Removals")
+        self._apply_btn.setFixedWidth(150)
+        self._apply_btn.setEnabled(False)
+        self._apply_btn.clicked.connect(self._apply)
+        layout.addWidget(self._apply_btn, alignment=Qt.AlignLeft)
+
+    # ── Check ─────────────────────────────────────────────────────────────────
+
+    def _check(self):
+        combined_obs = QC_DIR / 'combined' / 'ObserverLog_Detailed_QC_Combined.csv'
+        if not combined_obs.exists():
+            QMessageBox.warning(self, "Not Found",
+                                "Combined OBS file not found.\nRun QC first.")
+            return
+
+        obs = pd.read_csv(combined_obs, skiprows=2)
+        dup_mask = obs.duplicated(subset=['Line', 'Station'], keep=False)
+        dups     = obs[dup_mask]
+
+        # Clear previous results
+        while self._cont_lay.count():
+            item = self._cont_lay.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self._btn_groups = []
+        self._apply_btn.setEnabled(False)
+
+        if dups.empty:
+            self._status_lbl.setText("No duplicates found.")
+            self._status_lbl.setStyleSheet("color: green;")
+            lbl = QLabel("No duplicates found in combined files.")
+            lbl.setAlignment(Qt.AlignCenter)
+            self._cont_lay.addWidget(lbl)
+            self._cont_lay.addStretch()
+            return
+
+        n_groups = dups.groupby(['Line', 'Station']).ngroups
+        self._status_lbl.setText(
+            f"{n_groups} duplicate group{'s' if n_groups > 1 else ''} found.")
+        self._status_lbl.setStyleSheet("color: red;")
+
+        for (line, station), grp in dups.groupby(['Line', 'Station']):
+            gb        = QGroupBox(f"Line: {line}   \u00b7   Station: {station}")
+            gb_layout = QVBoxLayout(gb)
+            n_shots   = len(grp)
+            n_cols    = len(self._COLS) + 1
+
+            table = QTableWidget(n_shots, n_cols)
+            table.setHorizontalHeaderLabels(["Keep"] + [c[0] for c in self._COLS])
+            table.verticalHeader().setVisible(False)
+            table.setSelectionMode(QTableWidget.NoSelection)
+            table.setEditTriggers(QTableWidget.NoEditTriggers)
+            table.horizontalHeader().setStretchLastSection(False)
+
+            btn_group  = QButtonGroup(self)
+            shots_list = []
+            btn_group.buttonClicked.connect(self._on_selection_changed)
+
+            for row_i, (_, row) in enumerate(grp.iterrows()):
+                fn = str(row['File#'])
+                shots_list.append(fn)
+
+                radio_wrap = QWidget()
+                radio_hbox = QHBoxLayout(radio_wrap)
+                radio_hbox.setContentsMargins(4, 0, 4, 0)
+                radio_hbox.setAlignment(Qt.AlignCenter)
+                radio = QRadioButton()
+                btn_group.addButton(radio, row_i)
+                radio_hbox.addWidget(radio)
+                table.setCellWidget(row_i, 0, radio_wrap)
+
+                for col_i, (_, key) in enumerate(self._COLS):
+                    val  = str(row.get(key, 'N/A')).strip()
+                    item = QTableWidgetItem(val)
+                    item.setTextAlignment(Qt.AlignCenter)
+                    table.setItem(row_i, col_i + 1, item)
+
+            table.resizeColumnsToContents()
+            header_h = table.horizontalHeader().height()
+            rows_h   = sum(table.rowHeight(i) for i in range(n_shots))
+            table.setFixedHeight(header_h + rows_h + 4)
+
+            self._btn_groups.append((shots_list, btn_group))
+            gb_layout.addWidget(table)
+            self._cont_lay.addWidget(gb)
+
+        self._cont_lay.addStretch()
+
+    # ── Selection changed ─────────────────────────────────────────────────────
+
+    def _on_selection_changed(self):
+        all_resolved = bool(self._btn_groups) and all(
+            bg.checkedId() >= 0 for _, bg in self._btn_groups
+        )
+        self._apply_btn.setEnabled(all_resolved)
+
+    # ── Apply ─────────────────────────────────────────────────────────────────
+
+    def _apply(self):
+        discard_file_nums = set()
+        for shots_list, btn_group in self._btn_groups:
+            keep_idx = btn_group.checkedId()
+            for i, fn in enumerate(shots_list):
+                if i != keep_idx:
+                    discard_file_nums.add(fn)
+
+        if not discard_file_nums:
+            return
+
+        self.log.emit("\n══════════════════════════════════════════")
+        self.log.emit("  Combined File Check — Applying Removals")
+        self.log.emit("══════════════════════════════════════════")
+        for fn in sorted(discard_file_nums, key=lambda x: float(x)):
+            self.log.emit(f"  Removing File# {fn}")
+
+        try:
+            from file_io import remove_shots
+            remove_shots(discard_file_nums, QC_DIR, REMOVED_DIR, log_fn=self.log.emit)
+        except Exception:
+            import traceback
+            msg = traceback.format_exc()
+            self.log.emit(f"\n  ERROR:\n{msg}")
+            QMessageBox.critical(self, "Error", f"Removal failed:\n\n{msg}")
+            return
+
+        self.log.emit("══════════════════════════════════════════\n")
+        n = len(discard_file_nums)
+        QMessageBox.information(
+            self, "Done",
+            f"{n} shot{'s' if n > 1 else ''} removed. Re-checking…"
+        )
+        self._check()
+
+
 # ── Main window ────────────────────────────────────────────────────────────────
 
 class MainWindow(QMainWindow):
@@ -1329,7 +1674,12 @@ class MainWindow(QMainWindow):
         self.viz_tab.log.connect(self._append_log)
         self.tabs.addTab(self.viz_tab, "Stn Num Check")
 
-        # Tab 3 — vibe performance
+        # Tab 3 — combined file duplicate check
+        self.combined_check_tab = CombinedCheckTab()
+        self.combined_check_tab.log.connect(self._append_log)
+        self.tabs.addTab(self.combined_check_tab, "Combined File Check")
+
+        # Tab 4 — vibe performance
         self.vibe_tab = VibeTab()
         self.tabs.addTab(self.vibe_tab, "Vibe QC")
 
@@ -1488,7 +1838,7 @@ class MainWindow(QMainWindow):
 
     def _on_results_ready(self, obs_df, cog_df, pss_df, date_part):
         self.viz_tab.update_plots(obs_df, cog_df, date_part)
-        self.vibe_tab.refresh(pss_df)
+        self.vibe_tab.refresh(pss_df, cog_df, date_part)
 
     def _on_done(self, success, message):
         self.run_btn.setEnabled(True)

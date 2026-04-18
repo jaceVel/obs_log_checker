@@ -317,6 +317,120 @@ def apply_station_corrections(corrections, date_part, qc_dir, removed_dir,
     log("  Combined files rebuilt.")
 
 
+# ── Shot removal ──────────────────────────────────────────────────────────────
+
+def _norm_fn(x):
+    """Normalise a File# value to a plain integer string, e.g. '2226.0' -> '2226'."""
+    try:
+        return str(int(float(x)))
+    except (ValueError, TypeError):
+        return str(x)
+
+
+def remove_shots(discard_file_nums, qc_dir, removed_dir, log_fn=None):
+    """
+    Remove the given File#s from their daily QC files (appending to the
+    corresponding removed files), then rebuild the combined files.
+
+    Args:
+        discard_file_nums: iterable of File# values (str or numeric)
+        qc_dir:            Path to QC_files/
+        removed_dir:       Path to lines_removed_files/
+        log_fn:            optional callable for progress messages
+    """
+    log        = log_fn or print
+    qc_dir     = Path(qc_dir)
+    removed_dir = Path(removed_dir)
+
+    discard_set = {_norm_fn(fn) for fn in discard_file_nums}
+
+    # Build File# -> date_part by scanning daily OBS files
+    fn_to_date = {}
+    for daily in sorted(qc_dir.iterdir()):
+        if not daily.is_dir() or daily.name == 'combined':
+            continue
+        obs_path = daily / f'ObserverLog_Detailed_QC_{daily.name}.csv'
+        if not obs_path.exists():
+            continue
+        obs = pd.read_csv(obs_path, skiprows=2)
+        for raw in obs['File#'].astype(str):
+            fn = _norm_fn(raw)
+            if fn in discard_set:
+                fn_to_date[fn] = daily.name
+
+    # Group discards by date_part
+    from collections import defaultdict
+    by_date = defaultdict(set)
+    for fn in discard_set:
+        if fn in fn_to_date:
+            by_date[fn_to_date[fn]].add(fn)
+        else:
+            log(f"  WARNING: File# {fn} not found in any daily folder — skipping")
+
+    for date_part, fns in by_date.items():
+        daily_qc = qc_dir     / date_part
+        daily_rm = removed_dir / date_part
+        daily_rm.mkdir(parents=True, exist_ok=True)
+
+        def _mask(series):
+            return series.map(_norm_fn).isin(fns)
+
+        # ── OBS ──────────────────────────────────────────────────────────────
+        obs_qc_path = daily_qc / f'ObserverLog_Detailed_QC_{date_part}.csv'
+        obs_rm_path = daily_rm / f'ObserverLog_Detailed_Removed_Lines_{date_part}.csv'
+        with open(obs_qc_path) as f:
+            title_line = f.readline()
+        obs_df   = pd.read_csv(obs_qc_path, skiprows=2)
+        m        = _mask(obs_df['File#'].astype(str))
+        kept_obs = obs_df[~m]
+        disc_obs = obs_df[m]
+        with open(obs_qc_path, 'w', newline='') as f:
+            f.write(title_line.rstrip('\n') + '\n\n')
+            kept_obs.to_csv(f, index=False)
+        if obs_rm_path.exists():
+            with open(obs_rm_path) as f:
+                rm_title = f.readline()
+            existing = pd.read_csv(obs_rm_path, skiprows=2)
+            disc_obs = pd.concat([existing, disc_obs], ignore_index=True)
+        else:
+            rm_title = title_line
+        with open(obs_rm_path, 'w', newline='') as f:
+            f.write(rm_title.rstrip('\n') + '\n\n')
+            disc_obs.to_csv(f, index=False)
+        log(f"  Updated OBS {date_part}: {m.sum()} shot(s) removed")
+
+        # ── PSS ──────────────────────────────────────────────────────────────
+        pss_qc_path = daily_qc / f'PSS_QC_{date_part}.csv'
+        pss_rm_path = daily_rm / f'PSS_Removed_Lines_{date_part}.csv'
+        if pss_qc_path.exists():
+            pss_df   = pd.read_csv(pss_qc_path)
+            m        = _mask(pss_df['File Num'].astype(str))
+            kept_pss = pss_df[~m]
+            disc_pss = pss_df[m]
+            kept_pss.to_csv(pss_qc_path, index=False)
+            if pss_rm_path.exists():
+                disc_pss = pd.concat([pd.read_csv(pss_rm_path), disc_pss], ignore_index=True)
+            disc_pss.to_csv(pss_rm_path, index=False)
+            log(f"  Updated PSS {date_part}: {m.sum()} row(s) removed")
+
+        # ── COG ──────────────────────────────────────────────────────────────
+        cog_qc_path = daily_qc / f'FinalCOG_QC_{date_part}.csv'
+        cog_rm_path = daily_rm / f'FinalCOG_Removed_Lines_{date_part}.csv'
+        if cog_qc_path.exists():
+            cog_df   = pd.read_csv(cog_qc_path)
+            m        = _mask(cog_df['FF ID'].astype(str))
+            kept_cog = cog_df[~m]
+            disc_cog = cog_df[m]
+            kept_cog.to_csv(cog_qc_path, index=False)
+            if cog_rm_path.exists():
+                disc_cog = pd.concat([pd.read_csv(cog_rm_path), disc_cog], ignore_index=True)
+            disc_cog.to_csv(cog_rm_path, index=False)
+            log(f"  Updated COG {date_part}: {m.sum()} row(s) removed")
+
+    combine_files(qc_dir, removed_dir)
+    log("  Combined files rebuilt.")
+
+
 # ── Combine ────────────────────────────────────────────────────────────────────
 
 def combine_files(qc_dir, removed_dir):
