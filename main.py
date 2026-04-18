@@ -10,15 +10,15 @@ from processors import (
 from file_io import gather_files, save_files, combine_files
 
 # ── Input ──────────────────────────────────────────────────────────────────────
-SOURCE_DIR      = r"D:\vcloud\Anglo_Planet_Downs_2D_2025_Job1071\End of Day Output"
-TARGET_ZIP      = "09_13_2025_15_53_44.zip"
+SOURCE_DIR      = r"D:\vcloud\DPIRD_MacquarieArc\SS EOD FILES"
+TARGET_ZIP      = "04_14_2026_16_26_06.zip"
 MODE            = "zip"         # "zip", "folder", or "both"
-VIBES_PER_POINT = 1             # Expected number of PSS entries per shot point
+VIBES_PER_POINT = 2             # Expected number of PSS entries per shot point
 
 # ── Output ─────────────────────────────────────────────────────────────────────
-RAW_DIR      = Path(r"C:\Users\jstep\OneDrive\Desktop\obs_checker_regal\raw")
-QC_DIR       = Path(r"C:\Users\jstep\OneDrive\Desktop\obs_checker_regal\QC_files")
-REMOVED_DIR  = Path(r"C:\Users\jstep\OneDrive\Desktop\obs_checker_regal\lines_removed_files")
+RAW_DIR      = Path(r"C:\Users\jstep\projects\obs_log_checker\raw")
+QC_DIR       = Path(r"C:\Users\jstep\projects\obs_log_checker\QC_files")
+REMOVED_DIR  = Path(r"C:\Users\jstep\projects\obs_log_checker\lines_removed_files")
 
 # ───────────────────────────────────────────────────────────────────────────────
 
@@ -38,7 +38,12 @@ def main():
 
     # 2. Process each log
     print("\n[2/6] Processing logs …")
-    obs_df, bad_obs_df, header_lines, obs_reasons = process_observer_log(obs_file)
+    obs_df, bad_obs_df, void_candidates, header_lines, obs_reasons = process_observer_log(obs_file)
+    if not void_candidates.empty:
+        print(f"\n  NOTE: {len(void_candidates)} void shot(s) with no replacement — "
+              "kept removed (run via GUI to review interactively).")
+        import pandas as pd
+        bad_obs_df = pd.concat([bad_obs_df, void_candidates], ignore_index=True)
     pss_df, bad_pss_df, pss_reasons              = process_pss_log(pss_file)
     cog_df, bad_cog_df, cog_reasons              = process_cog_log(cog_file)
 

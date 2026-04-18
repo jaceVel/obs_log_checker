@@ -1,4 +1,5 @@
 import glob
+import math
 import os
 import re
 import shutil
@@ -6,6 +7,7 @@ import tempfile
 import zipfile
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 # ── Filename patterns ──────────────────────────────────────────────────────────
@@ -142,9 +144,55 @@ def save_files(obs_df, bad_obs_df, pss_df, bad_pss_df, cog_df, bad_cog_df,
             raise
 
 
+# ── SPS reader ────────────────────────────────────────────────────────────────
+
+def read_sps(path, crs='EPSG:7855'):
+    """
+    Parse an SPS 2.1 source file into a DataFrame with WGS84 coordinates.
+
+    Fixed-width field positions (0-indexed):
+        record type : [0:1]
+        line        : [1:11]
+        point       : [11:21]
+        easting     : [46:55]
+        northing    : [55:65]
+        elevation   : [65:71]
+    """
+    from pyproj import Transformer
+    transformer = Transformer.from_crs(crs, 'EPSG:4326', always_xy=True)
+    records = []
+    with open(path) as f:
+        for raw in f:
+            if len(raw) < 71 or raw[0] != 'S':
+                continue
+            try:
+                ln  = int(float(raw[1:11].strip()))
+                pt  = float(raw[11:21].strip())
+                e   = float(raw[46:55].strip())
+                n   = float(raw[55:65].strip())
+                elv = float(raw[65:71].strip())
+            except ValueError:
+                continue
+            lon, lat = transformer.transform(e, n)
+            records.append({'Line': ln, 'Point': pt,
+                             'Lat': lat, 'Lon': lon, 'Elevation': elv})
+    return pd.DataFrame(records)
+
+
+def _haversine_vec(dec_lat, dec_lon, lats, lons):
+    """Return distances (metres) from a single point to an array of points."""
+    phi1  = math.radians(dec_lat)
+    dlats = np.radians(lats - dec_lat)
+    dlons = np.radians(lons - dec_lon)
+    a = (np.sin(dlats / 2) ** 2
+         + math.cos(phi1) * np.cos(np.radians(lats)) * np.sin(dlons / 2) ** 2)
+    return 6_371_000.0 * 2 * np.arctan2(np.sqrt(a), np.sqrt(1.0 - a))
+
+
 # ── Station corrections ────────────────────────────────────────────────────────
 
-def apply_station_corrections(corrections, date_part, qc_dir, removed_dir, log_fn=None):
+def apply_station_corrections(corrections, date_part, qc_dir, removed_dir,
+                               log_fn=None, sps_df=None):
     """
     Write corrected station numbers back to the daily QC files, then rebuild
     the combined files.
@@ -155,11 +203,18 @@ def apply_station_corrections(corrections, date_part, qc_dir, removed_dir, log_f
         qc_dir:      Path to QC_files/
         removed_dir: Path to lines_removed_files/
         log_fn:      optional callable for progress messages (defaults to print)
+        sps_df:      optional DataFrame from read_sps(); when supplied, all
+                     COG source-point and near-flag geometry columns are
+                     recalculated from the planned survey geometry.
 
-    Rules:
-        OBS  Station              ← new_station (as-is)
-        PSS  Station              ← new_station (as-is)
-        COG  Source Point Station ← new_station − 0.5
+    COG update rules:
+        Source Point Station              <- new_station - 0.5
+        Source Point Lat/Lon/X/Y/Elev    <- SPS lookup  (requires sps_df)
+        Distance to Source Point          <- haversine   (requires sps_df)
+        Source Point Elevation Difference <- SP Elev - Decoder Elev (requires sps_df)
+        Near Flag *                       <- nearest SPS point to decoder (requires sps_df)
+        Distance to Near Flag             <- haversine   (requires sps_df)
+        Near Point Elevation Difference   <- NF Elev - Decoder Elev (requires sps_df)
     """
     log = log_fn or print
     qc_dir   = Path(qc_dir)
@@ -167,6 +222,8 @@ def apply_station_corrections(corrections, date_part, qc_dir, removed_dir, log_f
 
     # Normalise keys: '2312.0' → '2312' so they match int columns in the CSVs
     corrections = {str(int(float(fn))): stn for fn, stn in corrections.items()}
+
+    has_sps = sps_df is not None and not sps_df.empty
 
     # ── OBS ──────────────────────────────────────────────────────────────────
     obs_path = daily_qc / f'ObserverLog_Detailed_QC_{date_part}.csv'
@@ -190,11 +247,70 @@ def apply_station_corrections(corrections, date_part, qc_dir, removed_dir, log_f
 
     # ── COG ──────────────────────────────────────────────────────────────────
     cog_path = daily_qc / f'FinalCOG_QC_{date_part}.csv'
-    cog_df = pd.read_csv(cog_path)
+    cog_df   = pd.read_csv(cog_path)
+
+    if has_sps:
+        sps_lats = sps_df['Lat'].values
+        sps_lons = sps_df['Lon'].values
+
     for fn, new_stn in corrections.items():
-        cog_df.loc[cog_df['FF ID'].astype(str) == fn, 'Source Point Station'] = float(new_stn) - 0.5
+        mask = cog_df['FF ID'].astype(str) == fn
+        if not mask.any():
+            continue
+
+        cog_df.loc[mask, 'Source Point Station'] = float(new_stn) - 0.5
+
+        if not has_sps:
+            continue
+
+        row_idx = cog_df.index[mask][0]
+        src_line = int(float(cog_df.at[row_idx, 'Source Point Line']))
+        dec_lat  = float(cog_df.at[row_idx, 'Decoder Lat'])
+        dec_lon  = float(cog_df.at[row_idx, 'Decoder Lon'])
+        dec_elv  = float(cog_df.at[row_idx, 'Decoder Elevation'])
+
+        # ── Source point lookup ───────────────────────────────────────────
+        sp_mask = (sps_df['Line'] == src_line) & (sps_df['Point'] == float(new_stn))
+        sp_rows = sps_df[sp_mask]
+        if not sp_rows.empty:
+            sp = sp_rows.iloc[0]
+            sp_lat, sp_lon, sp_elv = float(sp['Lat']), float(sp['Lon']), float(sp['Elevation'])
+            sp_dist = float(_haversine_vec(dec_lat, dec_lon,
+                                           np.array([sp_lat]), np.array([sp_lon]))[0])
+            cog_df.loc[mask, 'Source Point Lat']                  = sp_lat
+            cog_df.loc[mask, 'Source Point Lon']                  = sp_lon
+            cog_df.loc[mask, 'Source Point X']                    = sp_lon
+            cog_df.loc[mask, 'Source Point Y']                    = sp_lat
+            cog_df.loc[mask, 'Source Point Elevation']            = sp_elv
+            cog_df.loc[mask, 'Distance to Source Point']          = round(sp_dist, 2)
+            cog_df.loc[mask, 'Source Point Elevation Difference'] = round(dec_elv - sp_elv, 2)
+            log(f"    File# {fn}: Source Point ({src_line}, {new_stn}) "
+                f"Lat={sp_lat:.6f} Lon={sp_lon:.6f} Elev={sp_elv} Dist={sp_dist:.2f}m")
+        else:
+            log(f"    WARNING File# {fn}: SPS has no entry for Line {src_line} Point {new_stn}")
+
+        # ── Near flag: nearest SPS point to decoder ───────────────────────
+        dists  = _haversine_vec(dec_lat, dec_lon, sps_lats, sps_lons)
+        nf_idx = int(np.argmin(dists))
+        nf     = sps_df.iloc[nf_idx]
+        nf_lat, nf_lon = float(nf['Lat']), float(nf['Lon'])
+        nf_elv  = float(nf['Elevation'])
+        nf_dist = float(dists[nf_idx])
+        cog_df.loc[mask, 'Near Flag Line']                  = int(nf['Line'])
+        cog_df.loc[mask, 'Near Flag Station']               = float(nf['Point']) - 0.5
+        cog_df.loc[mask, 'Near Flag Lat']                   = nf_lat
+        cog_df.loc[mask, 'Near Flag Lon']                   = nf_lon
+        cog_df.loc[mask, 'Near Flag X']                     = nf_lon
+        cog_df.loc[mask, 'Near Flag Y']                     = nf_lat
+        cog_df.loc[mask, 'Near Flag Elevation']             = nf_elv
+        cog_df.loc[mask, 'Distance to Near Flag']           = round(nf_dist, 2)
+        cog_df.loc[mask, 'Near Point Elevation Difference'] = round(dec_elv - nf_elv, 2)
+
     cog_df.to_csv(cog_path, index=False)
-    log(f"  Updated COG: {cog_path.name}  (Source Point Station = station − 0.5)")
+    if has_sps:
+        log(f"  Updated COG: {cog_path.name}  (full geometry recalculated from SPS)")
+    else:
+        log(f"  Updated COG: {cog_path.name}  (Source Point Station only — no SPS loaded)")
 
     # ── Rebuild combined ──────────────────────────────────────────────────────
     combine_files(qc_dir, Path(removed_dir))

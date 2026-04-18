@@ -25,22 +25,38 @@ def process_observer_log(file_path):
     def flag(file_num, reason):
         reasons.setdefault(file_num, []).append(reason)
 
-    # Remove Void rows
-    void_mask = df['Status'] == 'Void'
+    # Split Void rows: those with a non-void replacement are removed immediately;
+    # those with no replacement are returned as void_candidates for interactive review.
+    void_mask      = df['Status'] == 'Void'
+    void_with_repl = []
+    void_no_repl   = []
+
     for idx in df[void_mask].index:
         file_num = df.loc[idx, 'File#']
         line, station = df.loc[idx, 'Line'], df.loc[idx, 'Station']
         flag(file_num, 'Status is Void')
-        has_replacement = df[
-            (df['Line'] == line) & (df['Station'] == station) & (df.index != idx)
-        ].any().any()
+        has_replacement = (
+            (df['Line']    == line)    &
+            (df['Station'] == station) &
+            (df.index      != idx)     &
+            (df['Status']  != 'Void')
+        ).any()
         if has_replacement:
             flag(file_num, f'Replacement found for Line={line}, Station={station}')
+            void_with_repl.append(idx)
         else:
             flag(file_num, f'No replacement found for Line={line}, Station={station}')
+            void_no_repl.append(idx)
 
-    bad_df = pd.concat([bad_df, df[void_mask]], ignore_index=True)
-    df = df[~void_mask].reset_index(drop=True)
+    # Capture void_candidates BEFORE any drop so original indices are still valid
+    void_candidates = df.loc[void_no_repl].copy() if void_no_repl else pd.DataFrame(columns=df.columns)
+
+    # Remove all void rows from df in one pass (avoids index-invalidation after reset)
+    if void_with_repl:
+        bad_df = pd.concat([bad_df, df.loc[void_with_repl]], ignore_index=True)
+    all_void_indices = void_with_repl + void_no_repl
+    if all_void_indices:
+        df = df.drop(index=all_void_indices).reset_index(drop=True)
 
     # Remove rows with 0 PSS received
     pss_zero_mask = df[' PSS Info'].str.match(r'0 of \d+ PSS Received', na=False)
@@ -67,7 +83,7 @@ def process_observer_log(file_path):
         bad_df = pd.concat([bad_df, df.loc[list(bad_indices)]], ignore_index=True)
         df = df.drop(index=list(bad_indices)).reset_index(drop=True)
 
-    return df, bad_df, header_lines, reasons
+    return df, bad_df, void_candidates, header_lines, reasons
 
 
 # ── PSS Log ────────────────────────────────────────────────────────────────────
@@ -113,6 +129,15 @@ def process_pss_log(file_path):
         flag(df.loc[idx, 'File Num'], idx, 'Blank or zero Sweep Checksum')
     bad_df = pd.concat([bad_df, df[invalid_checksum]], ignore_index=True)
     df = df[~invalid_checksum].reset_index(drop=True)
+
+    # Deduplicate by (File Num, Unit ID) — keep the last sweep per vibe per shot.
+    # Multiple rows can occur when a shot is retried (same File Num re-recorded);
+    # counting all of them inflates GPS quality tallies and PSS entry checks.
+    dup_mask = df.duplicated(subset=['File Num', 'Unit ID'], keep='last')
+    for idx in df[dup_mask].index:
+        flag(df.loc[idx, 'File Num'], idx, 'Duplicate (File Num, Unit ID) — earlier sweep discarded')
+    bad_df = pd.concat([bad_df, df[dup_mask]], ignore_index=True)
+    df = df[~dup_mask].reset_index(drop=True)
 
     return df, bad_df, reasons
 
